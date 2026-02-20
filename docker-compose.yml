@@ -2,8 +2,8 @@ services:
   cache-up:
     build: .
     container_name: cache-up
-    ports:
-      - "8080:8080"
+    # ports:
+    #   - "8080:8080"
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - LOG_LEVEL=${LOG_LEVEL:-info}
