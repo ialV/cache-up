@@ -1,7 +1,6 @@
 services:
   cache-up:
     build: .
-    container_name: cache-up
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - LOG_LEVEL=${LOG_LEVEL:-info}
@@ -13,7 +12,9 @@ services:
       start_period: 10s
       retries: 3
     networks:
-      - shared
+      shared:
+        aliases:
+          - cache-up
 
 networks:
   shared:
