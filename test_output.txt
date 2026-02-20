@@ -1,0 +1,48 @@
+﻿============================= test session starts =============================
+platform win32 -- Python 3.13.12, pytest-9.0.2, pluggy-1.6.0 -- C:\Users\dukii\AppData\Local\Microsoft\WindowsApps\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\python.exe
+cachedir: .pytest_cache
+rootdir: D:\lib\AI\neo-ai\autocache-py
+configfile: pyproject.toml
+plugins: anyio-4.12.1, asyncio-1.3.0
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 37 items
+
+tests/test_cache_injector.py::TestEstimateTokens::test_empty PASSED      [  2%]
+tests/test_cache_injector.py::TestEstimateTokens::test_english PASSED    [  5%]
+tests/test_cache_injector.py::TestEstimateTokens::test_chinese PASSED    [  8%]
+tests/test_cache_injector.py::TestEstimateTokens::test_long_english_above_threshold PASSED [ 10%]
+tests/test_cache_injector.py::TestSystemBreakpoint::test_string_system_gets_breakpoint PASSED [ 13%]
+tests/test_cache_injector.py::TestSystemBreakpoint::test_short_system_no_breakpoint PASSED [ 16%]
+tests/test_cache_injector.py::TestSystemBreakpoint::test_blocks_system_gets_breakpoint PASSED [ 18%]
+tests/test_cache_injector.py::TestToolsBreakpoint::test_tools_get_breakpoint PASSED [ 21%]
+tests/test_cache_injector.py::TestToolsBreakpoint::test_short_tools_no_breakpoint PASSED [ 24%]
+tests/test_cache_injector.py::TestMessageBreakpoint::test_penultimate_message_gets_breakpoint PASSED [ 27%]
+tests/test_cache_injector.py::TestMessageBreakpoint::test_single_message_no_content_breakpoint PASSED [ 29%]
+tests/test_cache_injector.py::TestMessageBreakpoint::test_tool_use_message_finds_text_block PASSED [ 32%]
+tests/test_cache_injector.py::TestMessageBreakpoint::test_tool_result_message_skipped PASSED [ 35%]
+tests/test_cache_injector.py::TestExistingCacheControl::test_existing_breakpoints_preserved PASSED [ 37%]
+tests/test_cache_injector.py::TestExistingCacheControl::test_max_breakpoints_respected PASSED [ 40%]
+tests/test_cache_injector.py::TestBuildCacheMetadata::test_metadata_after_injection PASSED [ 43%]
+tests/test_cache_injector.py::TestBuildCacheMetadata::test_metadata_no_injection PASSED [ 45%]
+tests/test_openai_compat.py::TestOpenAIToAnthropic::test_basic_message PASSED [ 48%]
+tests/test_openai_compat.py::TestOpenAIToAnthropic::test_system_message_extracted PASSED [ 51%]
+tests/test_openai_compat.py::TestOpenAIToAnthropic::test_multiple_system_messages_merged PASSED [ 54%]
+tests/test_openai_compat.py::TestOpenAIToAnthropic::test_default_max_tokens PASSED [ 56%]
+tests/test_openai_compat.py::TestOpenAIToAnthropic::test_tool_calls_translated PASSED [ 59%]
+tests/test_openai_compat.py::TestOpenAIToAnthropic::test_optional_params_forwarded PASSED [ 62%]
+tests/test_openai_compat.py::TestOpenAIToAnthropic::test_consecutive_roles_merged PASSED [ 64%]
+tests/test_openai_compat.py::TestOpenAIToAnthropic::test_tools_translated PASSED [ 67%]
+tests/test_openai_compat.py::TestAnthropicToOpenAI::test_basic_response PASSED [ 70%]
+tests/test_openai_compat.py::TestAnthropicToOpenAI::test_cache_usage_forwarded PASSED [ 72%]
+tests/test_openai_compat.py::TestAnthropicToOpenAI::test_tool_use_response PASSED [ 75%]
+tests/test_openai_compat.py::TestStreamingTranslation::test_message_start PASSED [ 78%]
+tests/test_openai_compat.py::TestStreamingTranslation::test_text_delta PASSED [ 81%]
+tests/test_openai_compat.py::TestStreamingTranslation::test_message_stop PASSED [ 83%]
+tests/test_routes.py::TestHealthEndpoint::test_health_returns_200 PASSED [ 86%]
+tests/test_routes.py::TestHealthEndpoint::test_savings_returns_200 PASSED [ 89%]
+tests/test_routes.py::TestMessagesEndpoint::test_invalid_json_returns_400 PASSED [ 91%]
+tests/test_routes.py::TestMessagesEndpoint::test_non_streaming_with_cache_headers PASSED [ 94%]
+tests/test_routes.py::TestMessagesEndpoint::test_bypass_header_skips_cache PASSED [ 97%]
+tests/test_routes.py::TestMessagesEndpoint::test_streaming_returns_event_stream PASSED [100%]
+
+============================= 37 passed in 0.87s ==============================

@@ -1,0 +1,345 @@
+"""
+HTTP routes — the API surface of autocache.
+
+POST /v1/messages          — Main proxy endpoint (drop-in for Anthropic API)
+POST /v1/chat/completions  — OpenAI-compatible endpoint (for OpenWebUI etc.)
+GET  /v1/models            — Model list (OpenAI-compatible)
+GET  /health               — Health check
+GET  /savings              — Cache hit statistics
+"""
+
+from __future__ import annotations
+
+import json
+import time
+import uuid
+
+import structlog
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from app import proxy
+from app.cache_injector import build_cache_metadata, inject_cache_breakpoints
+from app.config import settings
+from app.observability import RequestRecord, stats
+from app.openai_compat import (
+    anthropic_to_openai,
+    openai_to_anthropic,
+    translate_streaming_chunk,
+)
+
+logger = structlog.get_logger()
+router = APIRouter()
+
+VERSION = "0.1.0"
+
+# Available models for /v1/models endpoint
+AVAILABLE_MODELS = [
+    {"id": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4"},
+    {"id": "claude-3-5-sonnet-20241022", "name": "Claude 3.5 Sonnet"},
+    {"id": "claude-3-5-haiku-20241022", "name": "Claude 3.5 Haiku"},
+    {"id": "claude-3-opus-20240229", "name": "Claude 3 Opus"},
+]
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/messages (Anthropic native)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/v1/messages")
+async def messages(request: Request):
+    """Proxy endpoint — injects cache breakpoints, forwards to Anthropic."""
+    try:
+        body: dict = await request.json()
+    except Exception:
+        return JSONResponse({"error": {"type": "invalid_request", "message": "Invalid JSON body"}}, status_code=400)
+
+    model = body.get("model", "unknown")
+    is_streaming = body.get("stream", False)
+
+    # Check bypass header
+    if request.headers.get("x-autocache-bypass", "").lower() in ("true", "1"):
+        logger.info("route.bypass", model=model)
+        return await _forward_without_cache(body, dict(request.headers), is_streaming)
+
+    # Determine min tokens threshold (Haiku models need 2048)
+    min_tokens = settings.min_tokens_for_cache
+    if "haiku" in model.lower():
+        min_tokens = max(min_tokens, 2048)
+
+    # Inject cache breakpoints
+    injected_before = _count_breakpoints(body)
+    inject_cache_breakpoints(body, min_tokens=min_tokens)
+    injected_after = _count_breakpoints(body)
+    injected_count = injected_after - injected_before
+
+    meta = build_cache_metadata(body, injected_count)
+    autocache_headers = {f"x-autocache-{k}": v for k, v in meta.items()}
+
+    if request.headers.get("x-autocache-debug", "").lower() in ("true", "1"):
+        autocache_headers["x-autocache-model"] = model
+        autocache_headers["x-autocache-min-tokens"] = str(min_tokens)
+
+    incoming_headers = dict(request.headers)
+
+    if is_streaming:
+        return await _handle_streaming(body, incoming_headers, autocache_headers, meta, model)
+    else:
+        return await _handle_non_streaming(body, incoming_headers, autocache_headers, meta, model)
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/chat/completions (OpenAI compatible)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    """
+    OpenAI-compatible chat completions endpoint.
+
+    Translates OpenAI format → Anthropic, injects cache, forwards,
+    then translates response back to OpenAI format.
+    """
+    try:
+        openai_body: dict = await request.json()
+    except Exception:
+        return JSONResponse(
+            {"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
+            status_code=400,
+        )
+
+    model = openai_body.get("model", "unknown")
+    is_streaming = openai_body.get("stream", False)
+
+    logger.info("route.openai_compat", model=model, streaming=is_streaming)
+
+    # Translate OpenAI → Anthropic format
+    try:
+        anthropic_body = openai_to_anthropic(openai_body)
+    except Exception as e:
+        logger.exception("route.openai_translate_error")
+        return JSONResponse(
+            {"error": {"message": f"Failed to translate request: {e}", "type": "invalid_request_error"}},
+            status_code=400,
+        )
+
+    # Apply cache injection
+    min_tokens = settings.min_tokens_for_cache
+    if "haiku" in model.lower():
+        min_tokens = max(min_tokens, 2048)
+
+    injected_before = _count_breakpoints(anthropic_body)
+    inject_cache_breakpoints(anthropic_body, min_tokens=min_tokens)
+    injected_after = _count_breakpoints(anthropic_body)
+    injected_count = injected_after - injected_before
+
+    meta = build_cache_metadata(anthropic_body, injected_count)
+    autocache_headers = {f"x-autocache-{k}": v for k, v in meta.items()}
+
+    incoming_headers = dict(request.headers)
+
+    if is_streaming:
+        return await _handle_openai_streaming(anthropic_body, incoming_headers, autocache_headers, meta, model)
+    else:
+        return await _handle_openai_non_streaming(anthropic_body, incoming_headers, autocache_headers, meta, model)
+
+
+async def _handle_openai_non_streaming(
+    body: dict, incoming_headers: dict, autocache_headers: dict, meta: dict, model: str
+) -> JSONResponse:
+    """Handle non-streaming OpenAI-compat request."""
+    resp = await proxy.forward_request(body, incoming_headers)
+
+    usage = {}
+    try:
+        resp_data = json.loads(resp.content)
+        usage = resp_data.get("usage", {})
+    except (json.JSONDecodeError, AttributeError):
+        resp_data = {}
+
+    _record_stats(meta, model, streaming=False, usage=usage)
+
+    if resp.status_code != 200:
+        return JSONResponse(content=resp_data, status_code=resp.status_code, headers=autocache_headers)
+
+    openai_resp = anthropic_to_openai(resp_data, model)
+    return JSONResponse(content=openai_resp, status_code=200, headers=autocache_headers)
+
+
+async def _handle_openai_streaming(
+    body: dict, incoming_headers: dict, autocache_headers: dict, meta: dict, model: str
+) -> StreamingResponse:
+    """Handle streaming OpenAI-compat request — translate SSE chunks on the fly."""
+    body["stream"] = True
+    status_code, resp_headers, chunk_iter, usage_holder = await proxy.forward_streaming(body, incoming_headers)
+
+    response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+
+    async def _translated_stream():
+        buffer = ""
+        try:
+            async for raw_chunk in chunk_iter:
+                text = raw_chunk.decode("utf-8") if isinstance(raw_chunk, bytes) else raw_chunk
+                buffer += text
+
+                while "\n\n" in buffer:
+                    event_str, buffer = buffer.split("\n\n", 1)
+                    openai_chunks = translate_streaming_chunk(event_str, model, response_id)
+                    for chunk in openai_chunks:
+                        yield chunk.encode("utf-8")
+        except Exception:
+            logger.exception("route.openai_stream_error")
+        finally:
+            _record_stats(meta, model, streaming=True, usage=usage_holder)
+
+    return StreamingResponse(
+        _translated_stream(),
+        status_code=status_code,
+        headers=autocache_headers,
+        media_type="text/event-stream",
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/models (OpenAI compatible)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/v1/models")
+async def list_models():
+    """Return available models in OpenAI format (for OpenWebUI discovery)."""
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": m["id"],
+                "object": "model",
+                "created": 1700000000,
+                "owned_by": "anthropic",
+            }
+            for m in AVAILABLE_MODELS
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Streaming (Anthropic native)
+# ---------------------------------------------------------------------------
+
+
+async def _handle_streaming(
+    body: dict, incoming_headers: dict, autocache_headers: dict, meta: dict, model: str,
+) -> StreamingResponse:
+    status_code, resp_headers, chunk_iter, usage_holder = await proxy.forward_streaming(body, incoming_headers)
+    all_headers = {**resp_headers, **autocache_headers}
+
+    async def _wrapped_stream():
+        async for chunk in chunk_iter:
+            yield chunk
+        _record_stats(meta, model, streaming=True, usage=usage_holder)
+
+    return StreamingResponse(
+        _wrapped_stream(), status_code=status_code, headers=all_headers, media_type="text/event-stream",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Non-streaming (Anthropic native)
+# ---------------------------------------------------------------------------
+
+
+async def _handle_non_streaming(
+    body: dict, incoming_headers: dict, autocache_headers: dict, meta: dict, model: str,
+) -> JSONResponse:
+    resp = await proxy.forward_request(body, incoming_headers)
+
+    resp_body = resp.content
+    usage = {}
+    try:
+        resp_data = json.loads(resp_body)
+        usage = resp_data.get("usage", {})
+    except (json.JSONDecodeError, AttributeError):
+        pass
+
+    _record_stats(meta, model, streaming=False, usage=usage)
+
+    response = JSONResponse(
+        content=json.loads(resp_body) if resp_body else {},
+        status_code=resp.status_code,
+        headers=autocache_headers,
+    )
+    for key in ("x-request-id", "anthropic-ratelimit-requests-remaining", "anthropic-ratelimit-tokens-remaining"):
+        val = resp.headers.get(key)
+        if val:
+            response.headers[key] = val
+
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Bypass / Health / Savings
+# ---------------------------------------------------------------------------
+
+
+async def _forward_without_cache(body: dict, incoming_headers: dict, is_streaming: bool):
+    bypass_headers = {"x-autocache-injected": "false"}
+    if is_streaming:
+        status_code, resp_headers, chunk_iter, _ = await proxy.forward_streaming(body, incoming_headers)
+        return StreamingResponse(
+            chunk_iter, status_code=status_code,
+            headers={**resp_headers, **bypass_headers}, media_type="text/event-stream",
+        )
+    else:
+        resp = await proxy.forward_request(body, incoming_headers)
+        return JSONResponse(
+            content=json.loads(resp.content) if resp.content else {},
+            status_code=resp.status_code, headers=bypass_headers,
+        )
+
+
+@router.get("/health")
+async def health():
+    return {"status": "healthy", "version": VERSION}
+
+
+@router.get("/savings")
+async def savings():
+    return stats.get_summary()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _count_breakpoints(body: dict) -> int:
+    count = 0
+    system = body.get("system")
+    if isinstance(system, list):
+        count += sum(1 for b in system if isinstance(b, dict) and b.get("cache_control"))
+    for tool in body.get("tools", []):
+        if isinstance(tool, dict) and tool.get("cache_control"):
+            count += 1
+    for msg in body.get("messages", []):
+        content = msg.get("content")
+        if isinstance(content, list):
+            count += sum(1 for b in content if isinstance(b, dict) and b.get("cache_control"))
+    return count
+
+
+def _record_stats(meta: dict, model: str, streaming: bool, usage: dict):
+    stats.record(
+        RequestRecord(
+            timestamp=time.time(),
+            model=model,
+            estimated_total_tokens=int(meta.get("total_tokens", 0)),
+            estimated_cached_tokens=int(meta.get("cached_tokens", 0)),
+            breakpoints_injected=int(meta.get("breakpoints", 0)),
+            actual_input_tokens=usage.get("input_tokens", 0),
+            actual_cache_read_tokens=usage.get("cache_read_input_tokens", 0),
+            actual_cache_creation_tokens=usage.get("cache_creation_input_tokens", 0),
+            streaming=streaming,
+        )
+    )
