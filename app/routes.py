@@ -45,11 +45,15 @@ _FALLBACK_MODELS = [
 ]
 
 
-async def _fetch_anthropic_models() -> list[dict]:
+async def _fetch_anthropic_models(api_key: str = "") -> list[dict]:
     """Fetch all models from Anthropic /v1/models with pagination."""
     from app.proxy import get_client
     client = get_client()
-    api_key = settings.anthropic_api_key
+    if not api_key:
+        api_key = settings.anthropic_api_key
+    if not api_key:
+        logger.warning("models.no_api_key")
+        return []
     headers = {
         "x-api-key": api_key,
         "anthropic-version": "2023-06-01",
@@ -83,13 +87,13 @@ async def _fetch_anthropic_models() -> list[dict]:
     return all_models
 
 
-async def _get_models_cached() -> list[dict]:
+async def _get_models_cached(api_key: str = "") -> list[dict]:
     """Get models with in-memory caching."""
     now = time.time()
     if _model_cache["models"] and (now - _model_cache["fetched_at"]) < _MODEL_CACHE_TTL:
         return _model_cache["models"]
 
-    models = await _fetch_anthropic_models()
+    models = await _fetch_anthropic_models(api_key=api_key)
     if models:
         _model_cache["models"] = models
         _model_cache["fetched_at"] = now
@@ -267,9 +271,11 @@ async def _handle_openai_streaming(
 
 
 @router.get("/v1/models")
-async def list_models():
+async def list_models(request: Request):
     """Return available models in OpenAI format (dynamically fetched from Anthropic)."""
-    models = await _get_models_cached()
+    from app.proxy import _extract_api_key
+    api_key = _extract_api_key(dict(request.headers))
+    models = await _get_models_cached(api_key=api_key)
     return {
         "object": "list",
         "data": [
