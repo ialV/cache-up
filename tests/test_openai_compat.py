@@ -5,6 +5,7 @@ Tests for OpenAI ↔ Anthropic format translation.
 import json
 
 from app.openai_compat import (
+    _supports_adaptive,
     anthropic_to_openai,
     openai_to_anthropic,
     translate_streaming_chunk,
@@ -154,6 +155,161 @@ class TestOpenAIToAnthropic:
         assert len(result["tools"]) == 1
         assert result["tools"][0]["name"] == "get_weather"
         assert result["tools"][0]["input_schema"]["type"] == "object"
+
+    def test_thinking_true_adaptive_model(self, monkeypatch):
+        """thinking: true + 4.6 model → adaptive."""
+        monkeypatch.setattr("app.config.settings.default_thinking", "")
+        monkeypatch.setattr("app.config.settings.default_effort", "")
+        req = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 16000,
+            "thinking": True,
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        result = openai_to_anthropic(req)
+        assert result["thinking"] == {"type": "adaptive"}
+
+    def test_thinking_true_adaptive_sonnet_46(self, monkeypatch):
+        """thinking: true + Sonnet 4.6 → adaptive."""
+        monkeypatch.setattr("app.config.settings.default_thinking", "")
+        monkeypatch.setattr("app.config.settings.default_effort", "")
+        req = {
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 16000,
+            "thinking": True,
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        result = openai_to_anthropic(req)
+        assert result["thinking"] == {"type": "adaptive"}
+
+    def test_thinking_true_legacy_model(self, monkeypatch):
+        """thinking: true + older model → enabled + budget_tokens."""
+        monkeypatch.setattr("app.config.settings.default_thinking", "")
+        monkeypatch.setattr("app.config.settings.default_effort", "")
+        req = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 16000,
+            "thinking": True,
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        result = openai_to_anthropic(req)
+        assert result["thinking"]["type"] == "enabled"
+        assert result["thinking"]["budget_tokens"] == 10000
+
+    def test_thinking_dict_adaptive_on_46(self, monkeypatch):
+        """Dict with budget_tokens on 4.6 model → forced to adaptive."""
+        monkeypatch.setattr("app.config.settings.default_thinking", "")
+        monkeypatch.setattr("app.config.settings.default_effort", "")
+        req = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 16000,
+            "thinking": {"type": "enabled", "budget_tokens": 5000},
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        result = openai_to_anthropic(req)
+        assert result["thinking"] == {"type": "adaptive"}
+
+    def test_thinking_adaptive_on_legacy_fallback(self, monkeypatch):
+        """adaptive requested on legacy model → fallback to enabled."""
+        monkeypatch.setattr("app.config.settings.default_thinking", "")
+        monkeypatch.setattr("app.config.settings.default_effort", "")
+        req = {
+            "model": "claude-opus-4-5-20251101",
+            "max_tokens": 16000,
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        result = openai_to_anthropic(req)
+        assert result["thinking"]["type"] == "enabled"
+        assert result["thinking"]["budget_tokens"] == 10000
+
+    def test_effort_passthrough(self, monkeypatch):
+        """effort in request → output_config.effort."""
+        monkeypatch.setattr("app.config.settings.default_thinking", "")
+        monkeypatch.setattr("app.config.settings.default_effort", "")
+        req = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 16000,
+            "effort": "medium",
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        result = openai_to_anthropic(req)
+        assert result["output_config"]["effort"] == "medium"
+
+    def test_effort_via_output_config(self, monkeypatch):
+        """output_config.effort passthrough."""
+        monkeypatch.setattr("app.config.settings.default_thinking", "")
+        monkeypatch.setattr("app.config.settings.default_effort", "")
+        req = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 16000,
+            "output_config": {"effort": "low"},
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        result = openai_to_anthropic(req)
+        assert result["output_config"]["effort"] == "low"
+
+    def test_default_thinking_from_settings(self, monkeypatch):
+        """Settings default_thinking=true injects thinking when client omits it."""
+        monkeypatch.setattr("app.config.settings.default_thinking", "true")
+        monkeypatch.setattr("app.config.settings.default_effort", "")
+        req = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 16000,
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        result = openai_to_anthropic(req)
+        assert result["thinking"] == {"type": "adaptive"}
+
+    def test_default_thinking_budget_from_settings(self, monkeypatch):
+        """Settings default_thinking=10000 → enabled + budget on legacy model."""
+        monkeypatch.setattr("app.config.settings.default_thinking", "10000")
+        monkeypatch.setattr("app.config.settings.default_effort", "")
+        req = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 16000,
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        result = openai_to_anthropic(req)
+        assert result["thinking"] == {"type": "enabled", "budget_tokens": 10000}
+
+    def test_default_effort_from_settings(self, monkeypatch):
+        """Settings default_effort=high injects output_config when client omits it."""
+        monkeypatch.setattr("app.config.settings.default_thinking", "")
+        monkeypatch.setattr("app.config.settings.default_effort", "high")
+        req = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 16000,
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        result = openai_to_anthropic(req)
+        assert result["output_config"]["effort"] == "high"
+
+    def test_no_thinking_when_disabled(self, monkeypatch):
+        """Empty default_thinking and no client thinking → no thinking param."""
+        monkeypatch.setattr("app.config.settings.default_thinking", "")
+        monkeypatch.setattr("app.config.settings.default_effort", "")
+        req = {
+            "model": "claude-opus-4-6",
+            "max_tokens": 16000,
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        result = openai_to_anthropic(req)
+        assert "thinking" not in result
+
+
+class TestSupportsAdaptive:
+    def test_opus_46(self):
+        assert _supports_adaptive("claude-opus-4-6") is True
+
+    def test_sonnet_46(self):
+        assert _supports_adaptive("claude-sonnet-4-6") is True
+
+    def test_opus_45(self):
+        assert _supports_adaptive("claude-opus-4-5-20251101") is False
+
+    def test_sonnet_4(self):
+        assert _supports_adaptive("claude-sonnet-4-20250514") is False
 
 
 class TestAnthropicToOpenAI:

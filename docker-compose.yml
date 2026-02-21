@@ -6,6 +6,8 @@ services:
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - LOG_LEVEL=${LOG_LEVEL:-info}
+      - DEFAULT_THINKING=${DEFAULT_THINKING:-true}
+      - DEFAULT_EFFORT=${DEFAULT_EFFORT:-high}
     restart: unless-stopped
     healthcheck:
       test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')" ]

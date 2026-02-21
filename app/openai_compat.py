@@ -24,6 +24,16 @@ import structlog
 logger = structlog.get_logger()
 
 
+def _supports_adaptive(model: str) -> bool:
+    """Check if a model supports adaptive thinking (4.6 series).
+
+    Opus 4.6 and Sonnet 4.6 use thinking: {type: "adaptive"} + output_config.effort.
+    Older models (Opus 4.5, Sonnet 4.5, etc.) use thinking: {type: "enabled", budget_tokens: N}.
+    """
+    lower = model.lower()
+    return "4-6" in lower or "4.6" in lower
+
+
 # ---------------------------------------------------------------------------
 # Request: OpenAI → Anthropic
 # ---------------------------------------------------------------------------
@@ -93,6 +103,82 @@ def openai_to_anthropic(request: dict) -> dict:
     # Tools (OpenAI → Anthropic format)
     if request.get("tools"):
         anthropic_req["tools"] = [_translate_tool(t) for t in request["tools"]]
+
+    # --- Anthropic-specific parameter passthrough ---
+    _ANTHROPIC_PASSTHROUGH = {
+        "metadata",       # Request metadata
+        "top_k",          # Top-K sampling
+        "tool_choice",    # Tool choice strategy
+    }
+    for key in _ANTHROPIC_PASSTHROUGH:
+        if key in request:
+            anthropic_req[key] = request[key]
+
+    # --- Thinking + Effort auto-adaptation ---
+    # Priority: client-sent > environment default > disabled
+    #
+    # Latest Anthropic API (2026-02):
+    #   Opus 4.6 / Sonnet 4.6  → thinking: {type: "adaptive"} (budget_tokens deprecated)
+    #   Older models            → thinking: {type: "enabled", budget_tokens: N}
+    #   Effort control          → output_config: {effort: "low/medium/high/max"}
+    from app.config import settings
+
+    thinking = request.get("thinking")
+    if thinking is None and settings.default_thinking:
+        # Client didn't send thinking — apply server default
+        val = settings.default_thinking.strip().lower()
+        if val == "true":
+            thinking = True
+        elif val == "adaptive":
+            thinking = {"type": "adaptive"}
+        elif val.isdigit():
+            thinking = {"type": "enabled", "budget_tokens": int(val)}
+
+    if thinking:
+        model_lower = anthropic_req.get("model", "").lower()
+        adaptive = _supports_adaptive(model_lower)
+        default_budget = 10000
+
+        if isinstance(thinking, bool):
+            # thinking: true → auto-detect best config for model
+            if adaptive:
+                anthropic_req["thinking"] = {"type": "adaptive"}
+            else:
+                anthropic_req["thinking"] = {"type": "enabled", "budget_tokens": default_budget}
+        elif isinstance(thinking, dict):
+            thinking_type = thinking.get("type", "")
+            if adaptive:
+                # 4.6 models: always use adaptive (budget_tokens is deprecated)
+                anthropic_req["thinking"] = {"type": "adaptive"}
+            elif thinking_type == "adaptive":
+                # Non-4.6 model but client asked for adaptive → fallback to enabled
+                anthropic_req["thinking"] = {"type": "enabled", "budget_tokens": default_budget}
+            else:
+                # enabled + budget_tokens (older models)
+                anthropic_req["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": thinking.get("budget_tokens", default_budget),
+                }
+
+    # --- Effort parameter → output_config ---
+    effort = request.get("effort") or request.get("output_config", {}).get("effort")
+    if effort is None and settings.default_effort:
+        effort = settings.default_effort.strip().lower()
+    if effort:
+        anthropic_req.setdefault("output_config", {})["effort"] = effort
+
+    # Also pass through any key starting with "anthropic_" (future-proof)
+    for key, value in request.items():
+        if key.startswith("anthropic_") and key not in anthropic_req:
+            anthropic_req[key] = value
+
+    # Debug: log the final thinking/effort config
+    logger.info(
+        "openai_compat.translated",
+        model=anthropic_req.get("model"),
+        thinking=anthropic_req.get("thinking"),
+        output_config=anthropic_req.get("output_config"),
+    )
 
     return anthropic_req
 
@@ -216,11 +302,14 @@ def anthropic_to_openai(response: dict, model: str) -> dict:
     # Extract text content
     content_blocks = response.get("content", [])
     text_parts = []
+    thinking_parts = []
     tool_calls = []
 
     for block in content_blocks:
         if block.get("type") == "text":
             text_parts.append(block.get("text", ""))
+        elif block.get("type") == "thinking":
+            thinking_parts.append(block.get("thinking", ""))
         elif block.get("type") == "tool_use":
             tool_calls.append({
                 "id": block.get("id", ""),
@@ -231,9 +320,17 @@ def anthropic_to_openai(response: dict, model: str) -> dict:
                 },
             })
 
+    # Build content: prepend thinking in a <details> block if present
+    final_text = ""
+    if thinking_parts:
+        thinking_text = "\n".join(thinking_parts)
+        final_text += f"<details>\n<summary>Thinking</summary>\n\n{thinking_text}\n\n</details>\n\n"
+    if text_parts:
+        final_text += "\n".join(text_parts)
+
     message: dict = {
         "role": "assistant",
-        "content": "\n".join(text_parts) if text_parts else None,
+        "content": final_text if final_text else None,
     }
     if tool_calls:
         message["tool_calls"] = tool_calls
@@ -279,70 +376,107 @@ def anthropic_to_openai(response: dict, model: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
+class StreamTranslator:
+    """
+    Stateful translator for Anthropic SSE → OpenAI SSE.
+
+    Tracks the current content block type so thinking blocks
+    can be properly wrapped in <details> open/close tags.
+    """
+
+    def __init__(self, model: str, response_id: str):
+        self.model = model
+        self.response_id = response_id
+        # Track block types by index for proper close handling
+        self._block_types: dict[int, str] = {}
+
+    def translate(self, event_str: str) -> list[str]:
+        """Translate a raw Anthropic SSE event string into OpenAI SSE chunk(s)."""
+        chunks = []
+
+        for line in event_str.strip().split("\n"):
+            if not line.startswith("data: "):
+                continue
+
+            try:
+                data = json.loads(line[6:])
+            except json.JSONDecodeError:
+                continue
+
+            event_type = data.get("type", "")
+
+            if event_type == "message_start":
+                chunk = _make_openai_chunk(self.response_id, self.model, delta={"role": "assistant", "content": ""})
+                chunks.append(f"data: {json.dumps(chunk)}\n\n")
+
+            elif event_type == "content_block_start":
+                index = data.get("index", 0)
+                block = data.get("content_block", {})
+                block_type = block.get("type", "")
+                self._block_types[index] = block_type
+
+                if block_type == "thinking":
+                    chunk = _make_openai_chunk(self.response_id, self.model, delta={
+                        "content": "<details>\n<summary>Thinking</summary>\n\n"
+                    })
+                    chunks.append(f"data: {json.dumps(chunk)}\n\n")
+                elif block_type == "tool_use":
+                    chunk = _make_openai_chunk(self.response_id, self.model, delta={
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": block.get("id", ""),
+                            "type": "function",
+                            "function": {"name": block.get("name", ""), "arguments": ""},
+                        }]
+                    })
+                    chunks.append(f"data: {json.dumps(chunk)}\n\n")
+
+            elif event_type == "content_block_delta":
+                delta = data.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    chunk = _make_openai_chunk(self.response_id, self.model, delta={"content": delta.get("text", "")})
+                    chunks.append(f"data: {json.dumps(chunk)}\n\n")
+                elif delta.get("type") == "thinking_delta":
+                    chunk = _make_openai_chunk(self.response_id, self.model, delta={"content": delta.get("thinking", "")})
+                    chunks.append(f"data: {json.dumps(chunk)}\n\n")
+                elif delta.get("type") == "input_json_delta":
+                    chunk = _make_openai_chunk(self.response_id, self.model, delta={
+                        "tool_calls": [{"index": 0, "function": {"arguments": delta.get("partial_json", "")}}]
+                    })
+                    chunks.append(f"data: {json.dumps(chunk)}\n\n")
+
+            elif event_type == "content_block_stop":
+                index = data.get("index", 0)
+                block_type = self._block_types.pop(index, "")
+                if block_type == "thinking":
+                    chunk = _make_openai_chunk(self.response_id, self.model, delta={
+                        "content": "\n\n</details>\n\n"
+                    })
+                    chunks.append(f"data: {json.dumps(chunk)}\n\n")
+
+            elif event_type == "message_delta":
+                stop_reason = data.get("delta", {}).get("stop_reason", "")
+                stop_map = {"end_turn": "stop", "max_tokens": "length", "tool_use": "tool_calls"}
+                chunk = _make_openai_chunk(
+                    self.response_id, self.model,
+                    delta={},
+                    finish_reason=stop_map.get(stop_reason, "stop"),
+                )
+                chunks.append(f"data: {json.dumps(chunk)}\n\n")
+
+            elif event_type == "message_stop":
+                chunks.append("data: [DONE]\n\n")
+
+        return chunks
+
+
 def translate_streaming_chunk(event_str: str, model: str, response_id: str) -> list[str]:
     """
-    Translate a raw Anthropic SSE event string into OpenAI SSE chunk(s).
-
-    Returns a list of SSE-formatted strings ready to yield.
+    Stateless wrapper for backward compatibility.
+    For proper thinking block support, use StreamTranslator directly.
     """
-    chunks = []
-
-    for line in event_str.strip().split("\n"):
-        if not line.startswith("data: "):
-            continue
-
-        try:
-            data = json.loads(line[6:])
-        except json.JSONDecodeError:
-            continue
-
-        event_type = data.get("type", "")
-
-        if event_type == "message_start":
-            # Send initial chunk with role
-            chunk = _make_openai_chunk(response_id, model, delta={"role": "assistant", "content": ""})
-            chunks.append(f"data: {json.dumps(chunk)}\n\n")
-
-        elif event_type == "content_block_delta":
-            delta = data.get("delta", {})
-            if delta.get("type") == "text_delta":
-                text = delta.get("text", "")
-                chunk = _make_openai_chunk(response_id, model, delta={"content": text})
-                chunks.append(f"data: {json.dumps(chunk)}\n\n")
-            elif delta.get("type") == "input_json_delta":
-                # Tool call argument streaming
-                chunk = _make_openai_chunk(response_id, model, delta={
-                    "tool_calls": [{"index": 0, "function": {"arguments": delta.get("partial_json", "")}}]
-                })
-                chunks.append(f"data: {json.dumps(chunk)}\n\n")
-
-        elif event_type == "content_block_start":
-            block = data.get("content_block", {})
-            if block.get("type") == "tool_use":
-                chunk = _make_openai_chunk(response_id, model, delta={
-                    "tool_calls": [{
-                        "index": 0,
-                        "id": block.get("id", ""),
-                        "type": "function",
-                        "function": {"name": block.get("name", ""), "arguments": ""},
-                    }]
-                })
-                chunks.append(f"data: {json.dumps(chunk)}\n\n")
-
-        elif event_type == "message_delta":
-            stop_reason = data.get("delta", {}).get("stop_reason", "")
-            stop_map = {"end_turn": "stop", "max_tokens": "length", "tool_use": "tool_calls"}
-            chunk = _make_openai_chunk(
-                response_id, model,
-                delta={},
-                finish_reason=stop_map.get(stop_reason, "stop"),
-            )
-            chunks.append(f"data: {json.dumps(chunk)}\n\n")
-
-        elif event_type == "message_stop":
-            chunks.append("data: [DONE]\n\n")
-
-    return chunks
+    translator = StreamTranslator(model, response_id)
+    return translator.translate(event_str)
 
 
 def _make_openai_chunk(

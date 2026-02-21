@@ -23,6 +23,7 @@ from app.cache_injector import InjectionReport, build_cache_metadata, inject_cac
 from app.config import settings
 from app.observability import RequestRecord, stats
 from app.openai_compat import (
+    StreamTranslator,
     anthropic_to_openai,
     openai_to_anthropic,
     translate_streaming_chunk,
@@ -242,6 +243,7 @@ async def _handle_openai_streaming(
 
     async def _translated_stream():
         buffer = ""
+        translator = StreamTranslator(model, response_id)
         try:
             async for raw_chunk in chunk_iter:
                 text = raw_chunk.decode("utf-8") if isinstance(raw_chunk, bytes) else raw_chunk
@@ -249,7 +251,7 @@ async def _handle_openai_streaming(
 
                 while "\n\n" in buffer:
                     event_str, buffer = buffer.split("\n\n", 1)
-                    openai_chunks = translate_streaming_chunk(event_str, model, response_id)
+                    openai_chunks = translator.translate(event_str)
                     for chunk in openai_chunks:
                         yield chunk.encode("utf-8")
         except Exception:

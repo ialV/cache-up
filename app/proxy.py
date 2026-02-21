@@ -67,7 +67,7 @@ def _extract_api_key(headers: dict[str, str]) -> str:
     return settings.anthropic_api_key
 
 
-def _build_upstream_headers(incoming_headers: dict[str, str], api_key: str) -> dict[str, str]:
+def _build_upstream_headers(incoming_headers: dict[str, str], api_key: str, body: dict | None = None) -> dict[str, str]:
     """Build headers dict for the upstream Anthropic request."""
     out = {}
     for k, v in incoming_headers.items():
@@ -79,6 +79,17 @@ def _build_upstream_headers(incoming_headers: dict[str, str], api_key: str) -> d
     # Auth: Anthropic uses x-api-key
     out.pop("authorization", None)
     out["x-api-key"] = api_key
+
+    # Inject anthropic-beta header when extended thinking is requested
+    # Skip for Opus 4.6 (uses adaptive thinking, beta header is deprecated)
+    if body and body.get("thinking"):
+        model_lower = (body.get("model") or "").lower()
+        if "opus-4-6" not in model_lower:
+            existing_beta = out.get("anthropic-beta", "")
+            beta_value = "interleaved-thinking-2025-05-14"
+            if beta_value not in existing_beta:
+                out["anthropic-beta"] = f"{existing_beta},{beta_value}".strip(",") if existing_beta else beta_value
+
     return out
 
 
@@ -93,7 +104,7 @@ async def forward_request(body: dict, incoming_headers: dict[str, str]) -> httpx
     Caller is responsible for closing the response.
     """
     api_key = _extract_api_key(incoming_headers)
-    headers = _build_upstream_headers(incoming_headers, api_key)
+    headers = _build_upstream_headers(incoming_headers, api_key, body=body)
     client = get_client()
 
     logger.debug("proxy.forward", model=body.get("model"), streaming=False)
@@ -115,7 +126,7 @@ async def forward_streaming(
     when the `message_start` SSE event is intercepted during streaming.
     """
     api_key = _extract_api_key(incoming_headers)
-    headers = _build_upstream_headers(incoming_headers, api_key)
+    headers = _build_upstream_headers(incoming_headers, api_key, body=body)
     client = get_client()
 
     logger.debug("proxy.forward", model=body.get("model"), streaming=True)
