@@ -27,6 +27,15 @@ class RequestRecord:
     actual_cache_read_tokens: int = 0
     actual_cache_creation_tokens: int = 0
     streaming: bool = False
+    # Extended diagnostics (Phase 1.5)
+    system_tokens: int = 0
+    system_chars: int = 0
+    tool_tokens: int = 0
+    prefix_tokens: int = 0
+    message_count: int = 0
+    message_breakdown: list[dict] = field(default_factory=list)
+    injection_decisions: list[dict] = field(default_factory=list)
+    breakpoint_positions: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -55,6 +64,7 @@ class Stats:
         with_cache = sum(1 for r in records if r.breakpoints_injected > 0)
         total_est_tokens = sum(r.estimated_total_tokens for r in records)
         total_est_cached = sum(r.estimated_cached_tokens for r in records)
+        total_actual_input = sum(r.actual_input_tokens for r in records)
         total_actual_cache_read = sum(r.actual_cache_read_tokens for r in records)
         total_actual_cache_create = sum(r.actual_cache_creation_tokens for r in records)
 
@@ -67,12 +77,54 @@ class Stats:
                 "cache_ratio": round(total_est_cached / total_est_tokens, 3) if total_est_tokens else 0,
             },
             "actual_anthropic": {
+                "input_tokens": total_actual_input,
                 "cache_read_tokens": total_actual_cache_read,
                 "cache_creation_tokens": total_actual_cache_create,
-                "note": "From Anthropic response usage field (0 if not yet populated)",
+                "cache_ratio": (
+                    round(total_actual_cache_read / total_actual_input, 3)
+                    if total_actual_input else 0
+                ),
             },
             "window_seconds": round(time.time() - records[0].timestamp) if records else 0,
         }
+
+    def get_recent(self, n: int = 10) -> list[dict]:
+        """Return the last N requests with full diagnostics."""
+        with self._lock:
+            records = list(self._history)
+
+        recent = records[-n:] if len(records) > n else records
+        result = []
+        for r in recent:
+            entry = {
+                "timestamp": round(r.timestamp, 1),
+                "model": r.model,
+                "streaming": r.streaming,
+                "estimated": {
+                    "total_tokens": r.estimated_total_tokens,
+                    "cached_tokens": r.estimated_cached_tokens,
+                    "system_tokens": r.system_tokens,
+                    "system_chars": r.system_chars,
+                    "tool_tokens": r.tool_tokens,
+                    "prefix_tokens": r.prefix_tokens,
+                },
+                "messages": {
+                    "count": r.message_count,
+                    "breakdown": r.message_breakdown,
+                },
+                "breakpoints": {
+                    "injected": r.breakpoints_injected,
+                    "positions": r.breakpoint_positions,
+                    "decisions": r.injection_decisions,
+                },
+                "actual_anthropic": {
+                    "input_tokens": r.actual_input_tokens,
+                    "cache_read_tokens": r.actual_cache_read_tokens,
+                    "cache_creation_tokens": r.actual_cache_creation_tokens,
+                },
+            }
+            result.append(entry)
+        return result
 
 
 # Singleton

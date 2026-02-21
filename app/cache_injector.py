@@ -18,9 +18,57 @@ optional ttl parameter, but we use the default in Phase 1 for simplicity.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
+
 import structlog
 
 logger = structlog.get_logger()
+
+
+# ---------------------------------------------------------------------------
+# Injection report — structured diagnostics
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BPDecision:
+    """Record of a single breakpoint decision."""
+    name: str           # e.g. "system", "tools", "message[3]"
+    action: str         # "injected" or "skipped"
+    reason: str         # why — e.g. "prefix_tokens=3200>=1024", "insufficient_tokens"
+    tokens: int = 0     # estimated tokens at this position
+
+
+@dataclass
+class InjectionReport:
+    """Structured report of all cache injection decisions."""
+    system_tokens: int = 0
+    system_chars: int = 0
+    tool_tokens: int = 0
+    prefix_tokens: int = 0       # system + tools
+    message_count: int = 0
+    message_breakdown: list[dict] = field(default_factory=list)  # [{role, tokens}]
+    total_estimated_tokens: int = 0
+    min_tokens_threshold: int = 0
+    breakpoints_injected: list[str] = field(default_factory=list)
+    existing_breakpoints: int = 0
+    decisions: list[BPDecision] = field(default_factory=list)
+
+    def to_log_dict(self) -> dict:
+        """Compact dict for structured logging."""
+        return {
+            "system_tokens": self.system_tokens,
+            "system_chars": self.system_chars,
+            "tool_tokens": self.tool_tokens,
+            "prefix_tokens": self.prefix_tokens,
+            "message_count": self.message_count,
+            "msg_breakdown": self.message_breakdown,
+            "total_est_tokens": self.total_estimated_tokens,
+            "min_tokens": self.min_tokens_threshold,
+            "injected": self.breakpoints_injected,
+            "existing_bp": self.existing_breakpoints,
+            "decisions": [{"name": d.name, "action": d.action, "reason": d.reason} for d in self.decisions],
+        }
 
 # ---------------------------------------------------------------------------
 # Token estimation
@@ -126,37 +174,43 @@ def _estimate_messages_tokens(messages: list[dict]) -> int:
     return total
 
 
-def inject_cache_breakpoints(request: dict, min_tokens: int = 1024) -> dict:
+def inject_cache_breakpoints(request: dict, min_tokens: int = 1024) -> tuple[dict, InjectionReport]:
     """
     Inject cache_control breakpoints into an Anthropic API request dict.
 
-    Mutates and returns the same dict. Respects the 4-breakpoint limit.
+    Mutates the request dict in-place. Respects the 4-breakpoint limit.
     Does not overwrite existing cache_control fields.
 
-    Strategy: Uses aggregate token counting — system + tools tokens are summed
-    together when checking thresholds. This prevents skipping cache on Haiku
-    where system alone is under 2048 but system + tools combined are over.
+    Strategy:
+      - BP1/BP2: system+tools aggregate exceeds min_tokens threshold.
+      - BP3: cumulative prefix (system + tools + messages[0..i]) exceeds
+        min_tokens threshold. This ensures short chat messages still get
+        cached when the conversation grows.
 
     Returns:
-        The mutated request dict (also returned for convenience).
+        (request, InjectionReport) — the mutated request plus diagnostics.
     """
+    report = InjectionReport(min_tokens_threshold=min_tokens)
+
     max_breakpoints = 4
     existing = _count_existing_breakpoints(request)
     remaining = max_breakpoints - existing
+    report.existing_breakpoints = existing
 
     if remaining <= 0:
         logger.info("cache.skip", reason="max_breakpoints_already_reached", existing=existing)
-        return request
-
-    injected: list[str] = []
+        return request, report
 
     # Pre-calculate token counts for smarter threshold decisions
     system = request.get("system")
     system_tokens = 0
+    system_chars = 0
     if isinstance(system, str):
         system_tokens = estimate_tokens(system)
+        system_chars = len(system)
     elif isinstance(system, list) and system:
         system_tokens = sum(estimate_block_tokens(b) for b in system if isinstance(b, dict))
+        system_chars = sum(len(b.get("text", "")) for b in system if isinstance(b, dict))
 
     tools = request.get("tools")
     tool_tokens = 0
@@ -166,13 +220,41 @@ def inject_cache_breakpoints(request: dict, min_tokens: int = 1024) -> dict:
     # Aggregate prefix tokens — used for threshold check
     prefix_tokens = system_tokens + tool_tokens
 
+    report.system_tokens = system_tokens
+    report.system_chars = system_chars
+    report.tool_tokens = tool_tokens
+    report.prefix_tokens = prefix_tokens
+
+    # Build message breakdown for observability
+    messages = request.get("messages", [])
+    report.message_count = len(messages)
+    msg_token_list: list[int] = []
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, str):
+            t = estimate_tokens(content)
+        elif isinstance(content, list):
+            t = sum(estimate_block_tokens(b) for b in content if isinstance(b, dict))
+        else:
+            t = 0
+        msg_token_list.append(t)
+        report.message_breakdown.append({"role": msg.get("role", "?"), "tokens": t})
+
+    report.total_estimated_tokens = prefix_tokens + sum(msg_token_list)
+
     logger.debug(
         "cache.token_analysis",
         system_tokens=system_tokens,
+        system_chars=system_chars,
         tool_tokens=tool_tokens,
         prefix_tokens=prefix_tokens,
+        message_count=len(messages),
+        msg_breakdown=report.message_breakdown,
+        total_est=report.total_estimated_tokens,
         min_tokens=min_tokens,
     )
+
+    injected: list[str] = []
 
     # --- BP1: system ---
     # Cache if system alone OR system+tools combined exceed threshold
@@ -181,22 +263,17 @@ def inject_cache_breakpoints(request: dict, min_tokens: int = 1024) -> dict:
             request["system"] = [{"type": "text", "text": system, "cache_control": CACHE_CONTROL}]
             injected.append("system")
             remaining -= 1
+            report.decisions.append(BPDecision("system", "injected", f"prefix_tokens={prefix_tokens}>={min_tokens}", system_tokens))
         elif isinstance(system, list) and system:
             for block in reversed(system):
                 if isinstance(block, dict) and _is_cacheable_block(block) and not _already_has_cache_control(block):
                     block["cache_control"] = CACHE_CONTROL
                     injected.append("system")
                     remaining -= 1
+                    report.decisions.append(BPDecision("system", "injected", f"prefix_tokens={prefix_tokens}>={min_tokens}", system_tokens))
                     break
-    elif system_tokens > 0 and prefix_tokens < min_tokens:
-        logger.info(
-            "cache.skip_bp",
-            bp="system",
-            reason="insufficient_tokens",
-            system_tokens=system_tokens,
-            prefix_tokens=prefix_tokens,
-            min_tokens=min_tokens,
-        )
+    elif system_tokens > 0:
+        report.decisions.append(BPDecision("system", "skipped", f"prefix_tokens={prefix_tokens}<{min_tokens}", system_tokens))
 
     # --- BP2: tools[-1] ---
     # Cache if tools present and prefix exceeds threshold
@@ -206,70 +283,75 @@ def inject_cache_breakpoints(request: dict, min_tokens: int = 1024) -> dict:
             last_tool["cache_control"] = CACHE_CONTROL
             injected.append("tools")
             remaining -= 1
-    elif tool_tokens > 0 and prefix_tokens < min_tokens:
-        logger.info(
-            "cache.skip_bp",
-            bp="tools",
-            reason="insufficient_tokens",
-            tool_tokens=tool_tokens,
-            prefix_tokens=prefix_tokens,
-            min_tokens=min_tokens,
-        )
+            report.decisions.append(BPDecision("tools", "injected", f"prefix_tokens={prefix_tokens}>={min_tokens}", tool_tokens))
+    elif tool_tokens > 0:
+        report.decisions.append(BPDecision("tools", "skipped", f"prefix_tokens={prefix_tokens}<{min_tokens}", tool_tokens))
 
     # --- BP3: best message before the last user message ---
-    # Walk backwards from messages[-2], find the first message with enough
-    # total tokens whose last cacheable content block can hold a breakpoint.
-    # Token threshold is checked per-MESSAGE (sum of all blocks), not per-block.
-    # This handles:
-    #   - Normal text messages (string or blocks)
-    #   - Assistant messages with tool_use blocks (picks last text block)
-    #   - Skips tool_result-only messages (no cacheable text block)
-    if remaining > 0:
-        messages = request.get("messages", [])
-        if len(messages) >= 2:
-            for i in range(len(messages) - 2, -1, -1):
-                msg = messages[i]
-                content = msg.get("content")
+    # Uses CUMULATIVE prefix tokens (system + tools + messages[0..i]) to decide.
+    # Walk backwards from messages[-2], find the most-recent position where
+    # the cumulative prefix exceeds min_tokens and a cacheable block exists.
+    if remaining > 0 and len(messages) >= 2:
+        # Pre-compute cumulative token array:
+        # cumulative[i] = prefix_tokens + sum(msg_tokens[0..i])
+        cumulative = []
+        running = prefix_tokens
+        for t in msg_token_list:
+            running += t
+            cumulative.append(running)
 
-                # Calculate total tokens for this message
-                if isinstance(content, str):
-                    msg_tokens = estimate_tokens(content)
-                elif isinstance(content, list):
-                    msg_tokens = sum(estimate_block_tokens(b) for b in content if isinstance(b, dict))
-                else:
-                    continue
+        bp3_placed = False
+        for i in range(len(messages) - 2, -1, -1):
+            msg = messages[i]
+            content = msg.get("content")
+            cum_tokens = cumulative[i]
 
-                if msg_tokens < min_tokens:
-                    continue  # Message too small, try earlier ones
+            if cum_tokens < min_tokens:
+                report.decisions.append(BPDecision(
+                    f"message[{i}]", "skipped",
+                    f"cumulative={cum_tokens}<{min_tokens}",
+                    msg_token_list[i],
+                ))
+                continue  # Cumulative prefix too small
 
-                # Message has enough tokens — find a cacheable block to attach BP
-                if isinstance(content, str):
-                    messages[i]["content"] = [
-                        {"type": "text", "text": content, "cache_control": CACHE_CONTROL}
-                    ]
-                    injected.append(f"message[{i}]")
-                    remaining -= 1
-                    break
+            # Cumulative prefix is large enough — find a cacheable block
+            if isinstance(content, str):
+                messages[i]["content"] = [
+                    {"type": "text", "text": content, "cache_control": CACHE_CONTROL}
+                ]
+                injected.append(f"message[{i}]")
+                remaining -= 1
+                report.decisions.append(BPDecision(
+                    f"message[{i}]", "injected",
+                    f"cumulative={cum_tokens}>={min_tokens}",
+                    msg_token_list[i],
+                ))
+                bp3_placed = True
+                break
 
-                block = _find_last_cacheable_block_in_message(msg)
-                if block is not None and isinstance(block, dict) and block.get("type") == "text":
-                    block["cache_control"] = CACHE_CONTROL
-                    injected.append(f"message[{i}]")
-                    remaining -= 1
-                    break
+            block = _find_last_cacheable_block_in_message(msg)
+            if block is not None and isinstance(block, dict) and block.get("type") == "text":
+                block["cache_control"] = CACHE_CONTROL
+                injected.append(f"message[{i}]")
+                remaining -= 1
+                report.decisions.append(BPDecision(
+                    f"message[{i}]", "injected",
+                    f"cumulative={cum_tokens}>={min_tokens}",
+                    msg_token_list[i],
+                ))
+                bp3_placed = True
+                break
+            else:
+                report.decisions.append(BPDecision(
+                    f"message[{i}]", "skipped",
+                    f"cumulative={cum_tokens}>={min_tokens} but no cacheable block",
+                    msg_token_list[i],
+                ))
 
-            # Fallback: if no single message is big enough, check cumulative
-            # tokens across all history messages and place BP on messages[-2]
-            if not any("message[" in bp for bp in injected) and len(messages) >= 3:
-                cumulative = _estimate_messages_tokens(messages[:-1])
-                if cumulative >= min_tokens:
-                    for i in range(len(messages) - 2, -1, -1):
-                        block = _find_last_cacheable_block_in_message(messages[i])
-                        if block is not None and isinstance(block, dict) and block.get("type") == "text":
-                            block["cache_control"] = CACHE_CONTROL
-                            injected.append(f"message[{i}]:cumulative")
-                            remaining -= 1
-                            break
+        if not bp3_placed and len(messages) >= 2:
+            report.decisions.append(BPDecision("message_bp3", "skipped", "no suitable position found", 0))
+
+    report.breakpoints_injected = list(injected)
 
     logger.info(
         "cache.injected",
@@ -277,7 +359,7 @@ def inject_cache_breakpoints(request: dict, min_tokens: int = 1024) -> dict:
         total=len(injected) + existing,
         existing=existing,
     )
-    return request
+    return request, report
 
 
 # ---------------------------------------------------------------------------

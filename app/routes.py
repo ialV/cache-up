@@ -19,7 +19,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app import proxy
-from app.cache_injector import build_cache_metadata, inject_cache_breakpoints
+from app.cache_injector import InjectionReport, build_cache_metadata, inject_cache_breakpoints
 from app.config import settings
 from app.observability import RequestRecord, stats
 from app.openai_compat import (
@@ -69,10 +69,8 @@ async def messages(request: Request):
         min_tokens = max(min_tokens, 2048)
 
     # Inject cache breakpoints
-    injected_before = _count_breakpoints(body)
-    inject_cache_breakpoints(body, min_tokens=min_tokens)
-    injected_after = _count_breakpoints(body)
-    injected_count = injected_after - injected_before
+    body, report = inject_cache_breakpoints(body, min_tokens=min_tokens)
+    injected_count = len(report.breakpoints_injected)
 
     meta = build_cache_metadata(body, injected_count)
     autocache_headers = {f"x-autocache-{k}": v for k, v in meta.items()}
@@ -81,12 +79,14 @@ async def messages(request: Request):
         autocache_headers["x-autocache-model"] = model
         autocache_headers["x-autocache-min-tokens"] = str(min_tokens)
 
+    logger.debug("route.injection_report", **report.to_log_dict())
+
     incoming_headers = dict(request.headers)
 
     if is_streaming:
-        return await _handle_streaming(body, incoming_headers, autocache_headers, meta, model)
+        return await _handle_streaming(body, incoming_headers, autocache_headers, meta, model, report)
     else:
-        return await _handle_non_streaming(body, incoming_headers, autocache_headers, meta, model)
+        return await _handle_non_streaming(body, incoming_headers, autocache_headers, meta, model, report)
 
 
 # ---------------------------------------------------------------------------
@@ -130,24 +130,25 @@ async def chat_completions(request: Request):
     if "haiku" in model.lower():
         min_tokens = max(min_tokens, 2048)
 
-    injected_before = _count_breakpoints(anthropic_body)
-    inject_cache_breakpoints(anthropic_body, min_tokens=min_tokens)
-    injected_after = _count_breakpoints(anthropic_body)
-    injected_count = injected_after - injected_before
+    anthropic_body, report = inject_cache_breakpoints(anthropic_body, min_tokens=min_tokens)
+    injected_count = len(report.breakpoints_injected)
 
     meta = build_cache_metadata(anthropic_body, injected_count)
     autocache_headers = {f"x-autocache-{k}": v for k, v in meta.items()}
 
+    logger.debug("route.injection_report", **report.to_log_dict())
+
     incoming_headers = dict(request.headers)
 
     if is_streaming:
-        return await _handle_openai_streaming(anthropic_body, incoming_headers, autocache_headers, meta, model)
+        return await _handle_openai_streaming(anthropic_body, incoming_headers, autocache_headers, meta, model, report)
     else:
-        return await _handle_openai_non_streaming(anthropic_body, incoming_headers, autocache_headers, meta, model)
+        return await _handle_openai_non_streaming(anthropic_body, incoming_headers, autocache_headers, meta, model, report)
 
 
 async def _handle_openai_non_streaming(
-    body: dict, incoming_headers: dict, autocache_headers: dict, meta: dict, model: str
+    body: dict, incoming_headers: dict, autocache_headers: dict, meta: dict, model: str,
+    report: InjectionReport | None = None,
 ) -> JSONResponse:
     """Handle non-streaming OpenAI-compat request."""
     resp = await proxy.forward_request(body, incoming_headers)
@@ -159,7 +160,7 @@ async def _handle_openai_non_streaming(
     except (json.JSONDecodeError, AttributeError):
         resp_data = {}
 
-    _record_stats(meta, model, streaming=False, usage=usage)
+    _record_stats(meta, model, streaming=False, usage=usage, report=report)
 
     if resp.status_code != 200:
         return JSONResponse(content=resp_data, status_code=resp.status_code, headers=autocache_headers)
@@ -169,7 +170,8 @@ async def _handle_openai_non_streaming(
 
 
 async def _handle_openai_streaming(
-    body: dict, incoming_headers: dict, autocache_headers: dict, meta: dict, model: str
+    body: dict, incoming_headers: dict, autocache_headers: dict, meta: dict, model: str,
+    report: InjectionReport | None = None,
 ) -> StreamingResponse:
     """Handle streaming OpenAI-compat request — translate SSE chunks on the fly."""
     body["stream"] = True
@@ -192,7 +194,7 @@ async def _handle_openai_streaming(
         except Exception:
             logger.exception("route.openai_stream_error")
         finally:
-            _record_stats(meta, model, streaming=True, usage=usage_holder)
+            _record_stats(meta, model, streaming=True, usage=usage_holder, report=report)
 
     return StreamingResponse(
         _translated_stream(),
@@ -231,6 +233,7 @@ async def list_models():
 
 async def _handle_streaming(
     body: dict, incoming_headers: dict, autocache_headers: dict, meta: dict, model: str,
+    report: InjectionReport | None = None,
 ) -> StreamingResponse:
     status_code, resp_headers, chunk_iter, usage_holder = await proxy.forward_streaming(body, incoming_headers)
     all_headers = {**resp_headers, **autocache_headers}
@@ -238,7 +241,7 @@ async def _handle_streaming(
     async def _wrapped_stream():
         async for chunk in chunk_iter:
             yield chunk
-        _record_stats(meta, model, streaming=True, usage=usage_holder)
+        _record_stats(meta, model, streaming=True, usage=usage_holder, report=report)
 
     return StreamingResponse(
         _wrapped_stream(), status_code=status_code, headers=all_headers, media_type="text/event-stream",
@@ -252,6 +255,7 @@ async def _handle_streaming(
 
 async def _handle_non_streaming(
     body: dict, incoming_headers: dict, autocache_headers: dict, meta: dict, model: str,
+    report: InjectionReport | None = None,
 ) -> JSONResponse:
     resp = await proxy.forward_request(body, incoming_headers)
 
@@ -263,7 +267,7 @@ async def _handle_non_streaming(
     except (json.JSONDecodeError, AttributeError):
         pass
 
-    _record_stats(meta, model, streaming=False, usage=usage)
+    _record_stats(meta, model, streaming=False, usage=usage, report=report)
 
     response = JSONResponse(
         content=json.loads(resp_body) if resp_body else {},
@@ -309,37 +313,42 @@ async def savings():
     return stats.get_summary()
 
 
+@router.get("/savings/recent")
+async def savings_recent(n: int = 10):
+    """Return the last N requests with full injection diagnostics."""
+    return stats.get_recent(n=min(n, 50))
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _count_breakpoints(body: dict) -> int:
-    count = 0
-    system = body.get("system")
-    if isinstance(system, list):
-        count += sum(1 for b in system if isinstance(b, dict) and b.get("cache_control"))
-    for tool in body.get("tools", []):
-        if isinstance(tool, dict) and tool.get("cache_control"):
-            count += 1
-    for msg in body.get("messages", []):
-        content = msg.get("content")
-        if isinstance(content, list):
-            count += sum(1 for b in content if isinstance(b, dict) and b.get("cache_control"))
-    return count
-
-
-def _record_stats(meta: dict, model: str, streaming: bool, usage: dict):
-    stats.record(
-        RequestRecord(
-            timestamp=time.time(),
-            model=model,
-            estimated_total_tokens=int(meta.get("total_tokens", 0)),
-            estimated_cached_tokens=int(meta.get("cached_tokens", 0)),
-            breakpoints_injected=int(meta.get("breakpoints", 0)),
-            actual_input_tokens=usage.get("input_tokens", 0),
-            actual_cache_read_tokens=usage.get("cache_read_input_tokens", 0),
-            actual_cache_creation_tokens=usage.get("cache_creation_input_tokens", 0),
-            streaming=streaming,
-        )
+def _record_stats(
+    meta: dict, model: str, streaming: bool, usage: dict,
+    report: InjectionReport | None = None,
+):
+    rec = RequestRecord(
+        timestamp=time.time(),
+        model=model,
+        estimated_total_tokens=int(meta.get("total_tokens", 0)),
+        estimated_cached_tokens=int(meta.get("cached_tokens", 0)),
+        breakpoints_injected=int(meta.get("breakpoints", 0)),
+        actual_input_tokens=usage.get("input_tokens", 0),
+        actual_cache_read_tokens=usage.get("cache_read_input_tokens", 0),
+        actual_cache_creation_tokens=usage.get("cache_creation_input_tokens", 0),
+        streaming=streaming,
     )
+    if report:
+        rec.system_tokens = report.system_tokens
+        rec.system_chars = report.system_chars
+        rec.tool_tokens = report.tool_tokens
+        rec.prefix_tokens = report.prefix_tokens
+        rec.message_count = report.message_count
+        rec.message_breakdown = report.message_breakdown
+        rec.breakpoint_positions = report.breakpoints_injected
+        rec.injection_decisions = [
+            {"name": d.name, "action": d.action, "reason": d.reason, "tokens": d.tokens}
+            for d in report.decisions
+        ]
+    stats.record(rec)
