@@ -31,15 +31,72 @@ from app.openai_compat import (
 logger = structlog.get_logger()
 router = APIRouter()
 
-VERSION = "0.1.0"
+# ---------------------------------------------------------------------------
+# Model list cache — fetches from Anthropic, caches for 5 minutes
+# ---------------------------------------------------------------------------
 
-# Available models for /v1/models endpoint
-AVAILABLE_MODELS = [
-    {"id": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4"},
-    {"id": "claude-3-5-sonnet-20241022", "name": "Claude 3.5 Sonnet"},
-    {"id": "claude-3-5-haiku-20241022", "name": "Claude 3.5 Haiku"},
-    {"id": "claude-3-opus-20240229", "name": "Claude 3 Opus"},
+_model_cache: dict = {"models": [], "fetched_at": 0.0}
+_MODEL_CACHE_TTL = 300  # 5 minutes
+
+# Minimal fallback if Anthropic API is unreachable
+_FALLBACK_MODELS = [
+    {"id": "claude-sonnet-4-20250514", "display_name": "Claude Sonnet 4"},
+    {"id": "claude-3-5-haiku-20241022", "display_name": "Claude 3.5 Haiku"},
 ]
+
+
+async def _fetch_anthropic_models() -> list[dict]:
+    """Fetch all models from Anthropic /v1/models with pagination."""
+    from app.proxy import get_client
+    client = get_client()
+    api_key = settings.anthropic_api_key
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+    }
+
+    all_models = []
+    after_id = None
+
+    try:
+        for _ in range(10):  # safety: max 10 pages
+            params = {"limit": 100}
+            if after_id:
+                params["after_id"] = after_id
+
+            resp = await client.get("/v1/models", params=params, headers=headers)
+            if resp.status_code != 200:
+                logger.warning("models.fetch_error", status=resp.status_code)
+                break
+
+            data = resp.json()
+            all_models.extend(data.get("data", []))
+
+            if not data.get("has_more"):
+                break
+            after_id = data.get("last_id")
+
+        logger.info("models.fetched", count=len(all_models))
+    except Exception:
+        logger.exception("models.fetch_exception")
+
+    return all_models
+
+
+async def _get_models_cached() -> list[dict]:
+    """Get models with in-memory caching."""
+    now = time.time()
+    if _model_cache["models"] and (now - _model_cache["fetched_at"]) < _MODEL_CACHE_TTL:
+        return _model_cache["models"]
+
+    models = await _fetch_anthropic_models()
+    if models:
+        _model_cache["models"] = models
+        _model_cache["fetched_at"] = now
+        return models
+
+    # Fallback: return cached (even if stale) or hardcoded
+    return _model_cache["models"] or _FALLBACK_MODELS
 
 
 # ---------------------------------------------------------------------------
@@ -211,17 +268,18 @@ async def _handle_openai_streaming(
 
 @router.get("/v1/models")
 async def list_models():
-    """Return available models in OpenAI format (for OpenWebUI discovery)."""
+    """Return available models in OpenAI format (dynamically fetched from Anthropic)."""
+    models = await _get_models_cached()
     return {
         "object": "list",
         "data": [
             {
                 "id": m["id"],
                 "object": "model",
-                "created": 1700000000,
+                "created": int(time.mktime(time.strptime(m["created_at"][:10], "%Y-%m-%d"))) if m.get("created_at") else 1700000000,
                 "owned_by": "anthropic",
             }
-            for m in AVAILABLE_MODELS
+            for m in models
         ],
     }
 
@@ -305,7 +363,7 @@ async def _forward_without_cache(body: dict, incoming_headers: dict, is_streamin
 
 @router.get("/health")
 async def health():
-    return {"status": "healthy", "version": VERSION}
+    return {"status": "healthy", "version": "0.2.0"}
 
 
 @router.get("/savings")
