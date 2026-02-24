@@ -27,7 +27,7 @@ def get_client() -> httpx.AsyncClient:
     global _client
     if _client is None or _client.is_closed:
         _client = httpx.AsyncClient(
-            base_url=settings.anthropic_base_url,
+            base_url=settings.resolved_base_url,
             timeout=httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0),
             limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
         )
@@ -73,12 +73,29 @@ def _build_upstream_headers(incoming_headers: dict[str, str], api_key: str, body
     for k, v in incoming_headers.items():
         if k.lower() not in _HOP_BY_HOP:
             out[k] = v
-    # Always set required Anthropic headers
+    # Always set required content type
     out["content-type"] = "application/json"
-    out["anthropic-version"] = incoming_headers.get("anthropic-version", "2023-06-01")
-    # Auth: Anthropic uses x-api-key
+    
     out.pop("authorization", None)
-    out["x-api-key"] = api_key
+
+    # Authentication & Provider-specific headers
+    provider = settings.upstream_provider.lower()
+    if provider == "anthropic":
+        out["anthropic-version"] = incoming_headers.get("anthropic-version", "2023-06-01")
+        out["x-api-key"] = api_key
+    elif provider == "openrouter":
+        out.pop("anthropic-version", None)
+        out["authorization"] = f"Bearer {api_key}"
+        if settings.openrouter_site_url:
+            out["HTTP-Referer"] = settings.openrouter_site_url
+        if settings.openrouter_app_name:
+            out["X-Title"] = settings.openrouter_app_name
+    elif provider == "generic":
+        out.pop("anthropic-version", None)
+        out["authorization"] = f"Bearer {api_key}"
+    else:
+        out["anthropic-version"] = incoming_headers.get("anthropic-version", "2023-06-01")
+        out["x-api-key"] = api_key
 
     # Inject anthropic-beta header when extended thinking is requested
     # Skip for Opus 4.6 (uses adaptive thinking, beta header is deprecated)
@@ -98,6 +115,16 @@ def _build_upstream_headers(incoming_headers: dict[str, str], api_key: str, body
 # ---------------------------------------------------------------------------
 
 
+def _inject_provider_routing(body: dict):
+    """Inject OpenRouter specific provider routing if configured."""
+    if settings.upstream_provider.lower() == "openrouter" and settings.openrouter_require_provider:
+        if "provider" not in body:
+            body["provider"] = {
+                "order": [settings.openrouter_require_provider],
+                "allow_fallbacks": False
+            }
+
+
 async def forward_request(body: dict, incoming_headers: dict[str, str]) -> httpx.Response:
     """
     Forward a non-streaming request to Anthropic. Returns the complete response.
@@ -106,6 +133,8 @@ async def forward_request(body: dict, incoming_headers: dict[str, str]) -> httpx
     api_key = _extract_api_key(incoming_headers)
     headers = _build_upstream_headers(incoming_headers, api_key, body=body)
     client = get_client()
+
+    _inject_provider_routing(body)
 
     logger.debug("proxy.forward", model=body.get("model"), streaming=False)
 
@@ -128,6 +157,8 @@ async def forward_streaming(
     api_key = _extract_api_key(incoming_headers)
     headers = _build_upstream_headers(incoming_headers, api_key, body=body)
     client = get_client()
+
+    _inject_provider_routing(body)
 
     logger.debug("proxy.forward", model=body.get("model"), streaming=True)
 

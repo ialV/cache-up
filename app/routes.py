@@ -55,10 +55,18 @@ async def _fetch_anthropic_models(api_key: str = "") -> list[dict]:
     if not api_key:
         logger.warning("models.no_api_key")
         return []
-    headers = {
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-    }
+    provider = settings.upstream_provider.lower()
+    headers = {}
+    if provider in ("openrouter", "generic"):
+        headers["authorization"] = f"Bearer {api_key}"
+        if provider == "openrouter":
+            if settings.openrouter_site_url:
+                headers["HTTP-Referer"] = settings.openrouter_site_url
+            if settings.openrouter_app_name:
+                headers["X-Title"] = settings.openrouter_app_name
+    else:
+        headers["x-api-key"] = api_key
+        headers["anthropic-version"] = "2023-06-01"
 
     all_models = []
     after_id = None

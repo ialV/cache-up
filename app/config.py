@@ -6,9 +6,25 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     """Application settings — all configurable via environment variables."""
 
+    # Upstream Provider ("anthropic", "openrouter", "generic")
+    upstream_provider: str = "anthropic"
+    openrouter_site_url: str = ""
+    openrouter_app_name: str = ""
+    openrouter_require_provider: str = ""
+
     # Anthropic API (key can also come from request header)
     anthropic_api_key: str = ""
     anthropic_base_url: str = "https://api.anthropic.com"
+
+    @property
+    def resolved_base_url(self) -> str:
+        """Resolve the upstream base URL depending on the provider."""
+        if self.anthropic_base_url != "https://api.anthropic.com":
+            return self.anthropic_base_url
+        if self.upstream_provider == "openrouter":
+            return "https://openrouter.ai/api"
+        return self.anthropic_base_url
+
 
     # Server
     port: int = 8080

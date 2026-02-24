@@ -60,7 +60,8 @@ async def lifespan(app: FastAPI):
         "autocache.startup",
         version="0.1.0",
         port=settings.port,
-        anthropic_url=settings.anthropic_base_url,
+        upstream_url=settings.resolved_base_url,
+        provider=settings.upstream_provider,
         api_key_configured=bool(settings.anthropic_api_key),
         min_tokens=settings.min_tokens_for_cache,
     )
