@@ -10,8 +10,8 @@ services:
       - OPENROUTER_SITE_URL=${OPENROUTER_SITE_URL:-}
       - OPENROUTER_APP_NAME=${OPENROUTER_APP_NAME:-}
       - LOG_LEVEL=${LOG_LEVEL:-info}
-      - DEFAULT_THINKING=${DEFAULT_THINKING:-true}
-      - DEFAULT_EFFORT=${DEFAULT_EFFORT:-high}
+      - DEFAULT_THINKING=${DEFAULT_THINKING-}
+      - DEFAULT_EFFORT=${DEFAULT_EFFORT-}
     restart: unless-stopped
     healthcheck:
       test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')" ]
